@@ -13,6 +13,7 @@ namespace HotspotMonitorApp
         private readonly ContextMenuStrip _contextMenuStrip;
         private readonly ToolStripMenuItem _startWorkerMenuItem;
         private readonly ToolStripMenuItem _stopWorkerMenuItem;
+        private readonly ToolStripMenuItem _showConnectedClientsMenuItem;
         private bool _isWorkerRunning;
 
         public MainForm(ILogger<Worker> logger)
@@ -31,6 +32,9 @@ namespace HotspotMonitorApp
             _stopWorkerMenuItem.ToolTipText = "Stop the Hotspot Monitor service";
 
             _contextMenuStrip.Items.Add(_stopWorkerMenuItem);
+            _showConnectedClientsMenuItem = new ToolStripMenuItem("Connected Clients", null, ShowConnectedClientsToolStripMenuItem_Click) { Enabled = false };
+            _showConnectedClientsMenuItem.ToolTipText = "List connected clients (MAC - Hostnames)";
+            _contextMenuStrip.Items.Add(_showConnectedClientsMenuItem);
             _contextMenuStrip.Items.Add("Exit", null, ExitToolStripMenuItem_Click);
             _contextMenuStrip.Items[2].ToolTipText = "Exit the application";
 
@@ -46,11 +50,12 @@ namespace HotspotMonitorApp
             {
                 if (InvokeRequired)
                 {
-                    BeginInvoke(new Action(() => UpdateNotifyIconStatus(_isWorkerRunning, null, count)));
+                    BeginInvoke(new Action(() => { UpdateNotifyIconStatus(_isWorkerRunning, null, count); _showConnectedClientsMenuItem.Enabled = (count > 0); }));
                 }
                 else
                 {
                     UpdateNotifyIconStatus(_isWorkerRunning, null, count);
+                    _showConnectedClientsMenuItem.Enabled = (count > 0);
                 }
             };
             // Set an initial tooltip text which also appears on hover
@@ -91,6 +96,27 @@ namespace HotspotMonitorApp
         {
             _notifyIcon.Visible = false;
             Application.Exit();
+        }
+
+        private async void ShowConnectedClientsToolStripMenuItem_Click(object? sender, EventArgs e)
+        {
+            try
+            {
+                var clients = await Task.Run(() => _worker.GetConnectedClients());
+                if (clients == null || clients.Count == 0)
+                {
+                    MessageBox.Show("No connected clients found.", "Connected Clients", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                // Open a non-modal dialog showing clients in a user-friendly grid
+                var dlg = new ConnectedClientsForm(clients, () => _worker.GetConnectedClients());
+                dlg.Show();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Failed to retrieve connected clients: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
 
         private static Icon ConvertPngToIcon(Image pngImage, Size iconSize)

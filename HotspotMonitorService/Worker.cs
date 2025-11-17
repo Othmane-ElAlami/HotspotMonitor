@@ -236,6 +236,129 @@ namespace HotspotMonitorService
             }
         }
 
+        /// <summary>
+        /// Returns a list of connected clients with Name/IPs/MAC.
+        /// </summary>
+        public List<ConnectedClient> GetConnectedClients()
+        {
+            var results = new List<ConnectedClient>();
+            try
+            {
+                // Ensure WinRT availability is checked
+                if (!_inProcessWinRtAvailable.HasValue)
+                {
+                    lock (_winrtLock)
+                    {
+                        if (!_inProcessWinRtAvailable.HasValue)
+                        {
+                            _inProcessWinRtAvailable = CheckInProcessWinRtAvailability();
+                        }
+                    }
+                }
+
+                var script = @"
+                    $connectionProfile = [Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime]::GetInternetConnectionProfile()
+                    if ($null -eq $connectionProfile) { return }
+                    $tetheringManager = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime]::CreateFromConnectionProfile($connectionProfile)
+                    if ($null -eq $tetheringManager) { return }
+                    $clients = $tetheringManager.GetTetheringClients()
+                    foreach ($c in $clients) {
+                        $mac = [string]$c.MacAddress
+                        $name = $null
+                        $ipAddrs = @()
+                        foreach ($hn in $c.HostNames) {
+                            $cn = $hn.CanonicalName
+                            if ($cn -match '^\d{1,3}(?:\.\d{1,3}){3}$' -or $cn -match '^[0-9a-f:]+$') {
+                                $ipAddrs += $cn
+                            }
+                            if (-not $name) {
+                                if ($hn.DisplayName -and $hn.DisplayName.Trim()) { $name = $hn.DisplayName }
+                                elseif ($hn.RawName -and $hn.RawName.Trim()) { $name = $hn.RawName }
+                                elseif ($cn) { $name = $cn }
+                            }
+                        }
+                        $hosts = $name -join ',' # name is single, but keep consistent output format
+                        $ips = ($ipAddrs -join ',')
+                        Write-Output ($mac + '|' + $hosts + '|' + $ips)
+                    }
+                ";
+
+                if (_inProcessWinRtAvailable == false)
+                {
+                    if (!_fallbackLoggedOnce)
+                    {
+                        lock (_winrtLock) { if (!_fallbackLoggedOnce) { logger.LogInformation("GetConnectedClients: Using PowerShell.exe fallback for WinRT query."); _fallbackLoggedOnce = true; } }
+                    }
+                    var fallbackResult = RunScriptViaWindowsPowerShell(script);
+                    if (!string.IsNullOrWhiteSpace(fallbackResult.Error)) logger.LogWarning("GetConnectedClients fallback had errors: {0}", fallbackResult.Error);
+                    var outTextFallback = fallbackResult.Output ?? string.Empty;
+                    var lines = outTextFallback.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                    foreach (var line in lines)
+                    {
+                        var parts = line.Split('|');
+                        if (parts.Length >= 1)
+                        {
+                            var mac = parts[0].Trim().ToUpperInvariant();
+                            var name = parts.Length > 1 ? parts[1].Trim() : string.Empty;
+                            var ips = parts.Length > 2 ? parts[2].Trim() : string.Empty;
+                            results.Add(new ConnectedClient { MacAddress = mac, DeviceName = name, IpAddresses = ips });
+                        }
+                    }
+                    return results;
+                }
+
+                using PowerShell ps = PowerShell.Create();
+                ps.AddScript("Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned -Force");
+                ps.AddScript(script);
+                var result = ps.Invoke();
+                if (ps.HadErrors)
+                {
+                    var errors = string.Join("\n", ps.Streams.Error.Select(e => e.ToString()));
+                    logger.LogWarning("GetConnectedClients: PowerShell had errors: {errors}", errors);
+                    lock (_winrtLock) { _inProcessWinRtAvailable = false; if (!_fallbackLoggedOnce) { logger.LogInformation("GetConnectedClients: Falling back to PowerShell.exe fallback for WinRT query"); _fallbackLoggedOnce = true; } }
+                    var fallbackResult = RunScriptViaWindowsPowerShell(script);
+                    if (!string.IsNullOrWhiteSpace(fallbackResult.Error)) logger.LogWarning("GetConnectedClients fallback had errors: {0}", fallbackResult.Error);
+                    var outText = fallbackResult.Output ?? string.Empty;
+                    var lines = outText.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                    foreach (var line in lines)
+                    {
+                        var parts = line.Split('|');
+                        if (parts.Length >= 1)
+                        {
+                            var mac = parts[0].Trim().ToUpperInvariant();
+                            var name = parts.Length > 1 ? parts[1].Trim() : string.Empty;
+                            var ips = parts.Length > 2 ? parts[2].Trim() : string.Empty;
+                            results.Add(new ConnectedClient { MacAddress = mac, DeviceName = name, IpAddresses = ips });
+                        }
+                    }
+                    return results;
+                }
+
+                if (result != null && result.Count > 0)
+                {
+                    lock (_winrtLock) { _fallbackLoggedOnce = false; _inProcessWinRtAvailable = true; }
+                    foreach (var r in result)
+                    {
+                        var s = r?.ToString() ?? string.Empty;
+                        var parts = s.Split('|');
+                        if (parts.Length >= 1)
+                        {
+                            var mac = parts[0].Trim().ToUpperInvariant();
+                            var name = parts.Length > 1 ? parts[1].Trim() : string.Empty;
+                            var ips = parts.Length > 2 ? parts[2].Trim() : string.Empty;
+                            results.Add(new ConnectedClient { MacAddress = mac, DeviceName = name, IpAddresses = ips });
+                        }
+                    }
+                }
+                return results;
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Failed to get connected clients.");
+                return results;
+            }
+        }
+
         private bool CheckInProcessWinRtAvailability()
         {
             try
