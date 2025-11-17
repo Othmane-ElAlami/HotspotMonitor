@@ -1,6 +1,10 @@
 using Microsoft.Extensions.Logging;
 using System.Management.Automation;
 using System.ServiceProcess;
+using System.Security.Principal;
+using System.Diagnostics;
+using System.Text;
+using System.IO;
 
 namespace HotspotMonitorService
 {
@@ -38,6 +42,61 @@ namespace HotspotMonitorService
                     // Task was cancelled, break out of the loop
                     break;
                 }
+            }
+        }
+
+        private (string Output, string Error) RunScriptViaWindowsPowerShell(string script)
+        {
+            // Write script to a temporary file to avoid escaping issues
+            var tempFile = Path.Combine(Path.GetTempPath(), $"hotspot_script_{Guid.NewGuid():N}.ps1");
+            File.WriteAllText(tempFile, script, Encoding.UTF8);
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                Arguments = $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{tempFile}\"",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+
+            var output = new StringBuilder();
+            var error = new StringBuilder();
+
+            using (var proc = new Process { StartInfo = psi })
+            {
+                try
+                {
+                    proc.Start();
+                    output.Append(proc.StandardOutput.ReadToEnd());
+                    error.Append(proc.StandardError.ReadToEnd());
+                    proc.WaitForExit(30_000); // 30s limit
+                }
+                catch (Exception ex)
+                {
+                    error.AppendLine(ex.ToString());
+                }
+                finally
+                {
+                    try { File.Delete(tempFile); } catch { }
+                }
+            }
+
+            return (Output: output.ToString(), Error: error.ToString());
+        }
+
+        private bool IsRunningAsAdmin()
+        {
+            try
+            {
+                var identity = WindowsIdentity.GetCurrent();
+                var principal = new WindowsPrincipal(identity);
+                return principal.IsInRole(WindowsBuiltInRole.Administrator);
+            }
+            catch
+            {
+                return false;
             }
         }
 
@@ -86,19 +145,36 @@ namespace HotspotMonitorService
             ps.AddScript("Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned -Force");
             ps.Invoke();
 
-            // Check and start the WinRM service
-            ps.AddScript("Get-Service WinRM");
-            var serviceResult = ps.Invoke();
-            if (serviceResult.Count > 0 && serviceResult[0].BaseObject is ServiceController winrmService && winrmService.Status != ServiceControllerStatus.Running)
+            // Check and start the WinRM service (requires Administrator privileges)
+            try
             {
-                logger.LogInformation("Starting WinRM service...");
-                ps.Commands.Clear();
-                ps.AddScript("Start-Service WinRM");
-                ps.Invoke();
+                ps.AddScript("Get-Service WinRM -ErrorAction Stop");
+                var serviceResult = ps.Invoke();
+                if (serviceResult.Count > 0 && serviceResult[0].BaseObject is ServiceController winrmService && winrmService.Status != ServiceControllerStatus.Running)
+                {
+                    if (!IsRunningAsAdmin())
+                    {
+                        logger.LogWarning("Insufficient permissions to start WinRM service. Please run the HotspotMonitor service as Administrator or grant it appropriate privileges.");
+                    }
+                    else
+                    {
+                        logger.LogInformation("Starting WinRM service...");
+                        ps.Commands.Clear();
+                        ps.AddScript("Start-Service WinRM");
+                        ps.Invoke();
+                        if (ps.HadErrors)
+                        {
+                            logger.LogError("Failed to start WinRM service. Error: {error}", string.Join("\n", ps.Streams.Error.Select(e => e.ToString())));
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Cannot access WinRM service: {message}", ex.Message);
             }
 
-            // Import the WindowsCompatibility module
-            ps.AddScript("Import-Module WindowsCompatibility");
+            // Try to detect the WindowsCompatibility module; we'll fallback to launching windows powershell if missing
 
             // Define the script to reactivate the hotspot
             string hotspotScript = @"
@@ -116,13 +192,65 @@ namespace HotspotMonitorService
                     Await ($tetheringManager.StartTetheringAsync())([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
                 ";
 
-            // Use Invoke-WinCommand to execute the script
-            ps.AddScript($"Invoke-WinCommand -ScriptBlock {{{hotspotScript}}}");
+            // Detect whether Invoke-WinCommand (WindowsCompatibility) is available; fall back to running powershell.exe
+            bool hasWindowsCompatibility = false;
+            try
+            {
+                ps.Commands.Clear();
+                ps.AddScript("Get-Command Invoke-WinCommand -ErrorAction SilentlyContinue");
+                var cmd = ps.Invoke();
+                if (cmd != null && cmd.Count > 0)
+                {
+                    hasWindowsCompatibility = true;
+                }
+                else
+                {
+                    ps.Commands.Clear();
+                    ps.AddScript("Get-Module -ListAvailable WindowsCompatibility");
+                    var mod = ps.Invoke();
+                    hasWindowsCompatibility = mod != null && mod.Count > 0;
+                }
+            }
+            catch
+            {
+                hasWindowsCompatibility = false;
+            }
 
-            var result = ps.Invoke();
-            if (result.Count > 0) logger.LogInformation("Hotspot reactivation attempt: {output}", string.Join("\n", result.Where(r => r != null).Select(r => r.ToString())));
-            else if (ps.HadErrors) logger.LogError("Failed to reactivate hotspot. Error: {error}", string.Join("\n", ps.Streams.Error.Select(e => e.ToString())));
-            else logger.LogInformation("Hotspot reactivated successfully.");
+            // Execute the script. Prefer Invoke-WinCommand if available (WindowsCompatibility), otherwise run via powershell.exe as a fallback
+            var result = new System.Collections.ObjectModel.Collection<PSObject>();
+            if (hasWindowsCompatibility)
+            {
+                ps.Commands.Clear();
+                ps.AddScript($"Invoke-WinCommand -ScriptBlock {{{hotspotScript}}}");
+                result = ps.Invoke();
+            }
+            else
+            {
+                logger.LogWarning("WindowsCompatibility module not found - falling back to launching powershell.exe for tether control.");
+                var fallbackResult = RunScriptViaWindowsPowerShell(hotspotScript);
+                if (!string.IsNullOrEmpty(fallbackResult.Output))
+                {
+                    logger.LogInformation("Hotspot reactivation attempt (fallback powershell): {output}", fallbackResult.Output);
+                }
+                if (!string.IsNullOrEmpty(fallbackResult.Error))
+                {
+                    logger.LogError("Hotspot reactivation failed (fallback powershell): {error}", fallbackResult.Error);
+                }
+            }
+
+            // Collect results (if using PowerShell invocation)
+            if (result != null && result.Count > 0)
+            {
+                logger.LogInformation("Hotspot reactivation attempt: {output}", string.Join("\n", result.Where(r => r != null).Select(r => r.ToString())));
+            }
+            else if (ps.HadErrors)
+            {
+                logger.LogError("Failed to reactivate hotspot. Error: {error}", string.Join("\n", ps.Streams.Error.Select(e => e.ToString())));
+            }
+            else
+            {
+                logger.LogInformation("Hotspot reactivated successfully.");
+            }
         }
         private void DeactivateHotspot()
         {
@@ -132,8 +260,22 @@ namespace HotspotMonitorService
             ps.AddScript("Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned -Force");
             ps.Invoke();
 
-            // Import the WindowsCompatibility module
-            ps.AddScript("Import-Module WindowsCompatibility");
+            // Try to detect the WindowsCompatibility module; we'll fallback to launching windows powershell if missing
+            bool hasWindowsCompatibility = false;
+            try
+            {
+                ps.Commands.Clear();
+                ps.AddScript("Get-Command Invoke-WinCommand -ErrorAction SilentlyContinue");
+                var cmd = ps.Invoke();
+                if (cmd != null && cmd.Count > 0)
+                {
+                    hasWindowsCompatibility = true;
+                }
+            }
+            catch
+            {
+                hasWindowsCompatibility = false;
+            }
 
             // Define the script to deactivate the hotspot
             string hotspotScript = @"
@@ -151,13 +293,21 @@ namespace HotspotMonitorService
                     Await ($tetheringManager.StopTetheringAsync())([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
                 ";
 
-            // Use Invoke-WinCommand to execute the script
-            ps.AddScript($"Invoke-WinCommand -ScriptBlock {{{hotspotScript}}}");
-
-            var result = ps.Invoke();
-            if (result.Count > 0) logger.LogInformation("Hotspot deactivation attempt: {output}", string.Join("\n", result.Where(r => r != null).Select(r => r.ToString())));
-            else if (ps.HadErrors) logger.LogError("Failed to deactivate hotspot. Error: {error}", string.Join("\n", ps.Streams.Error.Select(e => e.ToString())));
-            else logger.LogInformation("Hotspot deactivated successfully.");
+            if (hasWindowsCompatibility)
+            {
+                ps.AddScript($"Invoke-WinCommand -ScriptBlock {{{hotspotScript}}}");
+                var result = ps.Invoke();
+                if (result.Count > 0) logger.LogInformation("Hotspot deactivation attempt: {output}", string.Join("\n", result.Where(r => r != null).Select(r => r.ToString())));
+                else if (ps.HadErrors) logger.LogError("Failed to deactivate hotspot. Error: {error}", string.Join("\n", ps.Streams.Error.Select(e => e.ToString())));
+                else logger.LogInformation("Hotspot deactivated successfully.");
+            }
+            else
+            {
+                logger.LogWarning("WindowsCompatibility module not found - falling back to launching powershell.exe for tether control.");
+                var fallbackResult = RunScriptViaWindowsPowerShell(hotspotScript);
+                if (!string.IsNullOrEmpty(fallbackResult.Output)) logger.LogInformation("Hotspot deactivation attempt (fallback powershell): {output}", fallbackResult.Output);
+                if (!string.IsNullOrEmpty(fallbackResult.Error)) logger.LogError("Hotspot deactivation failed (fallback powershell): {error}", fallbackResult.Error);
+            }
         }
 
     }
