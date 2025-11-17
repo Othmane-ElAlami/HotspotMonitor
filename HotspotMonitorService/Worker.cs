@@ -1,10 +1,9 @@
-using Microsoft.Extensions.Logging;
 using System.Management.Automation;
 using System.ServiceProcess;
 using System.Security.Principal;
 using System.Diagnostics;
 using System.Text;
-using System.IO;
+using System.Text.RegularExpressions;
 
 namespace HotspotMonitorService
 {
@@ -118,6 +117,65 @@ namespace HotspotMonitorService
                 _workCancellationTokenSource.Cancel();
                 // Deactivate the hotspot
                 DeactivateHotspot();
+            }
+        }
+
+        /// <summary>
+        /// Returns number of devices currently connected to the tethering network.
+        /// Returns -1 when the call fails or is not available.
+        /// </summary>
+        public int GetConnectedClientCount()
+        {
+            try
+            {
+                using PowerShell ps = PowerShell.Create();
+                ps.AddScript("Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned -Force");
+                var script = @"
+                    $connectionProfile = [Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime]::GetInternetConnectionProfile()
+                    if ($null -eq $connectionProfile) { -1; return }
+                    $tetheringManager = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime]::CreateFromConnectionProfile($connectionProfile)
+                    if ($null -eq $tetheringManager) { -1; return }
+                    $tetheringManager.ClientCount
+                ";
+                ps.AddScript(script);
+
+                var result = ps.Invoke();
+                if (ps.HadErrors)
+                {
+                    var errors = string.Join("\n", ps.Streams.Error.Select(e => e.ToString()));
+                    logger.LogWarning("GetConnectedClientCount: PowerShell had errors: {errors}", errors);
+
+                    // If the in-process PowerShell can't find WinRT types, fallback to executing via powershell.exe
+                    if (errors.Contains("Unable to find type", StringComparison.OrdinalIgnoreCase) || errors.Contains("WindowsRuntime", StringComparison.OrdinalIgnoreCase))
+                    {
+                        logger.LogInformation("GetConnectedClientCount: Falling back to powershell.exe fallback for WinRT query");
+                        var fallbackResult = RunScriptViaWindowsPowerShell(script);
+                        if (!string.IsNullOrWhiteSpace(fallbackResult.Error))
+                        {
+                            logger.LogWarning("GetConnectedClientCount fallback had errors: {0}", fallbackResult.Error);
+                        }
+                        var outText = fallbackResult.Output ?? string.Empty;
+                        var m = Regex.Match(outText, "\\b(-?\\d+)\\b");
+                        if (m.Success && int.TryParse(m.Groups[1].Value, out var val)) return val;
+                        // try to find any integer as last resort
+                        var m2 = Regex.Match(outText, "\\d+");
+                        if (m2.Success && int.TryParse(m2.Value, out var val2)) return val2;
+
+                        return -1;
+                    }
+                    return -1;
+                }
+
+                if (result != null && result.Count > 0 && int.TryParse(result[0].ToString(), out var count))
+                {
+                    return count;
+                }
+                return -1;
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Failed to get connected client count.");
+                return -1;
             }
         }
 
