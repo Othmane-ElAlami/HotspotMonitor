@@ -13,7 +13,6 @@ namespace HotspotMonitorApp
         private readonly ContextMenuStrip _contextMenuStrip;
         private readonly ToolStripMenuItem _startWorkerMenuItem;
         private readonly ToolStripMenuItem _stopWorkerMenuItem;
-        private readonly System.Windows.Forms.Timer _statusUpdateTimer;
         private bool _isWorkerRunning;
 
         public MainForm(ILogger<Worker> logger)
@@ -42,22 +41,16 @@ namespace HotspotMonitorApp
                 Text = NotifyIconStoppedText,
                 Visible = true
             };
-            // Periodically update tooltip with device count
-            _statusUpdateTimer = new System.Windows.Forms.Timer { Interval = 5000 };
-            _statusUpdateTimer.Tick += async (s, ev) =>
+            // Subscribe to Worker client count change events (event-driven updates)
+            _worker.ClientCountChanged += (count) =>
             {
-                // Avoid overlapping calls and keep UI responsive
-                _statusUpdateTimer.Stop();
-                try
+                if (InvokeRequired)
                 {
-                    var running = _isWorkerRunning;
-                    var count = await Task.Run(() => _worker.GetConnectedClientCount());
-                    UpdateNotifyIconStatus(running, null, count);
+                    BeginInvoke(new Action(() => UpdateNotifyIconStatus(_isWorkerRunning, null, count)));
                 }
-                catch { /* Ignore exceptions from timer */ }
-                finally
+                else
                 {
-                    _statusUpdateTimer.Start();
+                    UpdateNotifyIconStatus(_isWorkerRunning, null, count);
                 }
             };
             // Set an initial tooltip text which also appears on hover
@@ -81,7 +74,6 @@ namespace HotspotMonitorApp
             _isWorkerRunning = true;
             // Update the icon tooltip and show a brief balloon
             UpdateNotifyIconStatus(true, "Service started");
-            _statusUpdateTimer.Start();
         }
 
         private void StopWorkerToolStripMenuItem_Click(object? sender, EventArgs e)
@@ -93,7 +85,6 @@ namespace HotspotMonitorApp
             _isWorkerRunning = false;
             // Update the icon tooltip and show a brief balloon
             UpdateNotifyIconStatus(false, "Service stopped");
-            _statusUpdateTimer.Stop();
         }
 
         private void ExitToolStripMenuItem_Click(object? sender, EventArgs e)

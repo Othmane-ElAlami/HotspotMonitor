@@ -11,6 +11,11 @@ namespace HotspotMonitorService
     public class Worker(ILogger<Worker> logger) : BackgroundService
     {
         private CancellationTokenSource? _workCancellationTokenSource;
+        private bool? _inProcessWinRtAvailable;
+        private bool _fallbackLoggedOnce;
+        private readonly object _winrtLock = new();
+        public event Action<int>? ClientCountChanged;
+        private int _lastClientCount = -2; // -2 means unknown/not-initialized
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
@@ -33,6 +38,18 @@ namespace HotspotMonitorService
 
                 try
                 {
+                    // Check the current connected client count and notify listeners on change
+                    try
+                    {
+                        int clientCount = GetConnectedClientCount();
+                        if (clientCount != _lastClientCount)
+                        {
+                            _lastClientCount = clientCount;
+                            ClientCountChanged?.Invoke(clientCount);
+                        }
+                    }
+                    catch (Exception ex) { logger.LogDebug(ex, "Failed to update client count in loop"); }
+
                     // Wait for 5 seconds before checking again, or until the task is cancelled
                     await Task.Delay(5000, linkedToken);
                 }
@@ -47,7 +64,7 @@ namespace HotspotMonitorService
         private (string Output, string Error) RunScriptViaWindowsPowerShell(string script)
         {
             // Write script to a temporary file to avoid escaping issues
-            var tempFile = Path.Combine(Path.GetTempPath(), $"hotspot_script_{Guid.NewGuid():N}.ps1");
+            var tempFile = Path.Combine(Path.GetTempPath(), $"Hotspot_Script_{Guid.NewGuid():N}.ps1");
             File.WriteAllText(tempFile, script, Encoding.UTF8);
 
             var psi = new ProcessStartInfo
@@ -128,8 +145,18 @@ namespace HotspotMonitorService
         {
             try
             {
-                using PowerShell ps = PowerShell.Create();
-                ps.AddScript("Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned -Force");
+                // If unknown, check if in-process PowerShell supports WinRT types (thread-safe)
+                if (!_inProcessWinRtAvailable.HasValue)
+                {
+                    lock (_winrtLock)
+                    {
+                        if (!_inProcessWinRtAvailable.HasValue)
+                        {
+                            _inProcessWinRtAvailable = CheckInProcessWinRtAvailability();
+                        }
+                    }
+                }
+
                 var script = @"
                     $connectionProfile = [Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime]::GetInternetConnectionProfile()
                     if ($null -eq $connectionProfile) { -1; return }
@@ -137,6 +164,33 @@ namespace HotspotMonitorService
                     if ($null -eq $tetheringManager) { -1; return }
                     $tetheringManager.ClientCount
                 ";
+
+                // If in-process WinRT is not available, use the powershell.exe fallback directly.
+                if (_inProcessWinRtAvailable == false)
+                {
+                    lock (_winrtLock)
+                    {
+                        if (!_fallbackLoggedOnce)
+                        {
+                            logger.LogInformation("GetConnectedClientCount: Using PowerShell.exe fallback for WinRT query.");
+                            _fallbackLoggedOnce = true;
+                        }
+                    }
+                    var fallbackResult = RunScriptViaWindowsPowerShell(script);
+                    if (!string.IsNullOrWhiteSpace(fallbackResult.Error))
+                    {
+                        logger.LogWarning("GetConnectedClientCount fallback had errors: {0}", fallbackResult.Error);
+                    }
+                    var outTextFallback = fallbackResult.Output ?? string.Empty;
+                    var mFallback = Regex.Match(outTextFallback, "\\b(-?\\d+)\\b");
+                    if (mFallback.Success && int.TryParse(mFallback.Groups[1].Value, out var valFallback)) return valFallback;
+                    var mFallback2 = Regex.Match(outTextFallback, "\\d+");
+                    if (mFallback2.Success && int.TryParse(mFallback2.Value, out var valFallback2)) return valFallback2;
+                    return -1;
+                }
+
+                using PowerShell ps = PowerShell.Create();
+                ps.AddScript("Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned -Force");
                 ps.AddScript(script);
 
                 var result = ps.Invoke();
@@ -144,30 +198,33 @@ namespace HotspotMonitorService
                 {
                     var errors = string.Join("\n", ps.Streams.Error.Select(e => e.ToString()));
                     logger.LogWarning("GetConnectedClientCount: PowerShell had errors: {errors}", errors);
-
-                    // If the in-process PowerShell can't find WinRT types, fallback to executing via powershell.exe
-                    if (errors.Contains("Unable to find type", StringComparison.OrdinalIgnoreCase) || errors.Contains("WindowsRuntime", StringComparison.OrdinalIgnoreCase))
+                    // Mark WinRT as unavailable for in-process usage and fall back next time; log the fallback once.
+                    lock (_winrtLock)
                     {
-                        logger.LogInformation("GetConnectedClientCount: Falling back to powershell.exe fallback for WinRT query");
-                        var fallbackResult = RunScriptViaWindowsPowerShell(script);
-                        if (!string.IsNullOrWhiteSpace(fallbackResult.Error))
+                        _inProcessWinRtAvailable = false;
+                        if (!_fallbackLoggedOnce)
                         {
-                            logger.LogWarning("GetConnectedClientCount fallback had errors: {0}", fallbackResult.Error);
+                            logger.LogInformation("GetConnectedClientCount: Falling back to PowerShell.exe fallback for WinRT query");
+                            _fallbackLoggedOnce = true;
                         }
-                        var outText = fallbackResult.Output ?? string.Empty;
-                        var m = Regex.Match(outText, "\\b(-?\\d+)\\b");
-                        if (m.Success && int.TryParse(m.Groups[1].Value, out var val)) return val;
-                        // try to find any integer as last resort
-                        var m2 = Regex.Match(outText, "\\d+");
-                        if (m2.Success && int.TryParse(m2.Value, out var val2)) return val2;
-
-                        return -1;
                     }
+                    var fallbackResult = RunScriptViaWindowsPowerShell(script);
+                    if (!string.IsNullOrWhiteSpace(fallbackResult.Error))
+                    {
+                        logger.LogWarning("GetConnectedClientCount fallback had errors: {0}", fallbackResult.Error);
+                    }
+                    var outText = fallbackResult.Output ?? string.Empty;
+                    var m = Regex.Match(outText, "\\b(-?\\d+)\\b");
+                    if (m.Success && int.TryParse(m.Groups[1].Value, out var val)) return val;
+                    var m2 = Regex.Match(outText, "\\d+");
+                    if (m2.Success && int.TryParse(m2.Value, out var val2)) return val2;
                     return -1;
                 }
 
                 if (result != null && result.Count > 0 && int.TryParse(result[0].ToString(), out var count))
                 {
+                    // If in-process succeeded, clear fallback-logged marker and mark WinRT available
+                    lock (_winrtLock) { _fallbackLoggedOnce = false; _inProcessWinRtAvailable = true; }
                     return count;
                 }
                 return -1;
@@ -176,6 +233,24 @@ namespace HotspotMonitorService
             {
                 logger.LogWarning(ex, "Failed to get connected client count.");
                 return -1;
+            }
+        }
+
+        private bool CheckInProcessWinRtAvailability()
+        {
+            try
+            {
+                using PowerShell ps = PowerShell.Create();
+                ps.AddScript("Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction SilentlyContinue");
+                ps.AddScript("[System.Type]::GetType('Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime') -ne $null");
+                var res = ps.Invoke();
+                if (ps.HadErrors) return false;
+                if (res != null && res.Count > 0 && bool.TryParse(res[0].ToString(), out var b)) return b;
+                return false;
+            }
+            catch
+            {
+                return false;
             }
         }
 
