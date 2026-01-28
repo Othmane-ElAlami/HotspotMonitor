@@ -1,9 +1,10 @@
+using HotspotMonitorApp.UI;
 using HotspotMonitorService;
 using Microsoft.Extensions.Logging;
 
 namespace HotspotMonitorApp
 {
-    public partial class MainForm : Form
+    public partial class MainForm : RForm
     {
         private const string NotifyIconTitle = "Hotspot Monitor";
         private const string NotifyIconRunningText = NotifyIconTitle + ": Running";
@@ -19,6 +20,7 @@ namespace HotspotMonitorApp
         public MainForm(ILogger<Worker> logger)
         {
             InitializeComponent();
+            InitTheme(true);
 
             _worker = new Worker(logger);
             _contextMenuStrip = new ContextMenuStrip();
@@ -36,7 +38,10 @@ namespace HotspotMonitorApp
             _showConnectedClientsMenuItem.ToolTipText = "List connected clients (MAC - Hostnames)";
             _contextMenuStrip.Items.Add(_showConnectedClientsMenuItem);
             _contextMenuStrip.Items.Add("Exit", null, ExitToolStripMenuItem_Click);
-            _contextMenuStrip.Items[2].ToolTipText = "Exit the application";
+            _contextMenuStrip.Items[3].ToolTipText = "Exit the application";
+
+            // Apply theme to context menu
+            ControlHelper.AdjustContextMenuStrip(_contextMenuStrip);
 
             _notifyIcon = new NotifyIcon
             {

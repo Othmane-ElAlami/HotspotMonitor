@@ -1,4 +1,6 @@
-﻿namespace HotspotMonitorApp
+﻿using HotspotMonitorApp.UI;
+
+namespace HotspotMonitorApp
 {
     partial class MainForm
     {

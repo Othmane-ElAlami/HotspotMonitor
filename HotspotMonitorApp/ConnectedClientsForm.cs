@@ -1,13 +1,14 @@
+using HotspotMonitorApp.UI;
 using HotspotMonitorService;
 
 namespace HotspotMonitorApp
 {
-    public class ConnectedClientsForm : Form
+    public class ConnectedClientsForm : RForm
     {
         private readonly DataGridView _grid;
-        private readonly Button _btnRefresh;
-        private readonly Button _btnCopy;
-        private readonly Button _btnClose;
+        private readonly RButton _btnRefresh;
+        private readonly RButton _btnCopy;
+        private readonly RButton _btnClose;
         private List<ConnectedClient> _clients;
         private readonly Func<List<ConnectedClient>> _refreshFunc;
 
@@ -16,6 +17,9 @@ namespace HotspotMonitorApp
             Text = "Connected Clients";
             Size = new Size(600, 350);
             StartPosition = FormStartPosition.CenterScreen;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
             _clients = clients ?? new List<ConnectedClient>();
             _refreshFunc = refreshFunc;
 
@@ -28,16 +32,19 @@ namespace HotspotMonitorApp
                 AllowUserToAddRows = false,
                 AllowUserToDeleteRows = false,
                 MultiSelect = false,
-                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill
+                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+                BorderStyle = BorderStyle.None,
+                CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal,
+                RowHeadersVisible = false
             };
 
             _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Device", HeaderText = "Device Name" });
             _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Ip", HeaderText = "IP Address(es)" });
             _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Mac", HeaderText = "MAC" });
 
-            _btnRefresh = new Button { Text = "Refresh", Width = 80, Left = 8, Top = 270 };
-            _btnCopy = new Button { Text = "Copy", Width = 80, Left = 96, Top = 270 };
-            _btnClose = new Button { Text = "Close", Width = 80, Left = 184, Top = 270 };
+            _btnRefresh = new RButton { Text = "Refresh", Width = 80, Left = 8, Top = 270, Height = 30 };
+            _btnCopy = new RButton { Text = "Copy", Width = 80, Left = 96, Top = 270, Height = 30 };
+            _btnClose = new RButton { Text = "Close", Width = 80, Left = 184, Top = 270, Height = 30 };
 
             _btnRefresh.Click += BtnRefresh_Click;
             _btnCopy.Click += BtnCopy_Click;
@@ -47,6 +54,9 @@ namespace HotspotMonitorApp
             Controls.Add(_btnRefresh);
             Controls.Add(_btnCopy);
             Controls.Add(_btnClose);
+
+            // Initialize theme
+            InitTheme(true);
 
             PopulateGrid();
         }

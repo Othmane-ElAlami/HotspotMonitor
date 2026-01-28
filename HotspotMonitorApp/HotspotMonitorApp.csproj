@@ -7,6 +7,17 @@
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <PublishTrimmed>false</PublishTrimmed>
+
+    <!-- Portable/Release settings -->
+    <AssemblyName>HotspotMonitor</AssemblyName>
+    <Product>Hotspot Monitor</Product>
+    <Description>Monitor devices connected to your Windows Mobile Hotspot</Description>
+    <Company>Othmane-ElAlami</Company>
+    <Authors>Othmane-ElAlami</Authors>
+    <RepositoryUrl>https://github.com/Othmane-ElAlami/HotspotMonitor</RepositoryUrl>
+    <ApplicationIcon>Resources\icon.ico</ApplicationIcon>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
 
   <ItemGroup>
